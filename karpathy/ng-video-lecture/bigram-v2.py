@@ -5,14 +5,17 @@ from torch.nn import functional as F
 # ============================================================
 # 超参数配置
 # ============================================================
-batch_size = 32  # 每次并行处理多少个独立序列（批大小）
-block_size = 8   # 模型预测时使用的最大上下文长度（每条序列的字符数）
+batch_size = 64  # 每次并行处理多少个独立序列（批大小）
+block_size = 256   # 模型预测时使用的最大上下文长度（每条序列的字符数）
 max_iters = 5000      # 训练总迭代次数
-eval_interval = 300   # 每隔多少步评估一次损失
-learning_rate = 1e-3  # 学习率（AdamW 优化器的步长）
+eval_interval = 500   # 每隔多少步评估一次损失
+learning_rate = 3e-4  # 学习率（AdamW 优化器的步长）
 device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')  # 有 GPU 就用 GPU，否则用 CPU
-n_embd = 32
 eval_iters = 200      # 评估损失时，采样多少个批次取平均（减少估计方差）
+n_embd = 384
+n_layer = 6
+n_head = 6
+dropout = 0.2
 # ------------------------------------------------------------
 
 # 固定随机种子，保证实验可复现
@@ -95,6 +98,8 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+
+        self.dropout = nn.Dropout(dropout)
     
     def forward(self, x):
         B, T, C = x.shape
@@ -104,6 +109,8 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5 # (B, T, hs) @ (B, hs, T) -> (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
         wei = F.softmax(wei, dim=-1) # (B, T, T)
+        wei = self.dropout(wei)
+
         # perform the weighted aggregation of the values
         v = self.value(x) # (B,T,hs)
         out = wei @ v # (B, T, T) @ (B, T, hs) -> (B, T, hs)
@@ -113,12 +120,12 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        # self.proj = nn.Linear(head_size * num_heads, n_embd)
-        # self.dropout = nn.Dropout(dropout)
+        self.proj = nn.Linear(head_size * num_heads, n_embd)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
-        # out = self.dropout(self.proj(out))
+        out = self.dropout(self.proj(out))
         return out
 
 class FeedForward(nn.Module):
@@ -128,6 +135,7 @@ class FeedForward(nn.Module):
             nn.Linear(n_embd, 4 * n_embd),
             nn.ReLU(),
             nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout),
         )
 
     def forward(self, x):
@@ -168,7 +176,8 @@ class BigramLanguageModel(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
         
-        self.blocks = nn.Sequential(*[Block(n_embd, n_head=4) for _ in range(4)])
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)
 
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
@@ -193,6 +202,7 @@ class BigramLanguageModel(nn.Module):
         
         x = tok_emb + pos_emb  # (B, T, n_embd)
         x = self.blocks(x)  # (B, T, n_embd)
+        x = self.ln_f(x)  # (B, T, n_embd)
         
         logits = self.lm_head(x)  # (B, T, vocab_size)
 
